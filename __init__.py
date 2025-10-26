@@ -18,7 +18,9 @@ class WriteTimestampsOperator(bpy.types.Operator):
         marker_path = output_dir + 'markers.txt' 
         with open(marker_path, 'w') as mf:
             for marker in sorted_markers:
-                mf.write('{} {}\n'.format(frame_to_time(marker.frame, fps, fps_base), marker.name))
+                message = '{} {}\n'.format(frame_to_time(marker.frame, fps, fps_base), marker.name)
+                self.report({'INFO'}, message.strip())
+                mf.write(message)
         return {'FINISHED'}
 
 class RenderAudioFilesOperator(ModalTimerOperator):
@@ -136,25 +138,31 @@ class FillGapsOperator(bpy.types.Operator):
         self.report({'INFO'}, f"Channel {channel}:")
         found = (strip for strip in context.scene.sequence_editor.sequences if strip.channel == channel)
         strips_in_channel = sorted(found, key=lambda s: s.frame_final_start)
-        previous = None
+        previous = strips_in_channel.pop(0) if strips_in_channel else None
+        gaps_fixed = 0
+        markers_adjusted = 0
         for strip in strips_in_channel:
             self.report({'DEBUG'}, f"  - {strip.name} (Start: {strip.frame_final_start}, End: {strip.frame_final_end})")
-            if previous is not None:
-                gap = strip.frame_final_start - previous.frame_final_end
-                if gap > 0:
-                    self.report({'INFO'}, f"    Filling gap of {gap} frames before {strip.name}")
-                    text_strip = context.scene.sequence_editor.sequences.new_effect(
-                        name=f"GapFiller_{previous.frame_final_end}_{strip.frame_final_start}",
-                        type='TEXT',
-                        channel=channel,
-                        frame_start=previous.frame_final_end,
-                        frame_end=strip.frame_final_start
-                    )
-                    text_strip.text = "Gap Filler"
-                    for marker in context.scene.timeline_markers:
-                        if previous.frame_final_end <= marker.frame:
-                            marker.frame += gap
+            gap = strip.frame_final_start - previous.frame_final_end
+            if gap <= 0:
+                previous = strip
+                continue
+            self.report({'INFO'}, f"    Filling gap of {gap} frames before {strip.name}")
+            text_strip = context.scene.sequence_editor.sequences.new_effect(
+                name=f"GapFiller_{previous.frame_final_end}_{strip.frame_final_start}",
+                type='TEXT',
+                channel=channel,
+                frame_start=previous.frame_final_end,
+                frame_end=strip.frame_final_start
+            )
+            gaps_fixed += 1
+            text_strip.text = "Gap Filler"
+            for marker in context.scene.timeline_markers:
+                if previous.frame_final_end <= marker.frame:
+                    marker.frame += gap
+                    markers_adjusted += 1
             previous = strip
+        self.report({'INFO'}, f"Gaps fixed: {gaps_fixed}, Markers adjusted: {markers_adjusted}")
         return {'FINISHED'}
 
     
