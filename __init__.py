@@ -1,35 +1,6 @@
 import bpy
 import re
-import subprocess
-
-def execute_command(self, command):
-    self.report({'INFO'}, "$ " + command)
-    result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    output = result.stdout.strip()
-    error = result.stderr.strip()
-    if output:
-        self.report({'INFO'}, output)
-    if error:
-        self.report({'ERROR'}, error)
-
-def frame_to_time(frame_number, fps, fps_base):
-    # Calculate raw time in seconds
-    raw_time = (frame_number - 1) / (fps / fps_base)
-    
-    # Calculate hours, minutes, seconds, and frames for timecode format
-    hours = int(raw_time / 3600)
-    minutes = int((raw_time % 3600) / 60)
-    seconds = int(raw_time % 60)
-    # frames = int(((raw_time % 1) * (fps / fps_base))) # Remaining fractional part as frames
-    
-    return f"{hours:02}:{minutes:02}:{seconds:02}"
-
-def get_output_dir(self, context):
-    scene = context.scene
-    output_path = scene.render.filepath
-    if not output_path.endswith('/'):
-        output_path = '/'.join(output_path.split('/')[:-1]) + '/'
-    return output_path
+from .der_blender_addon import execute_command, frame_to_time, get_output_dir, ModalTimerOperator
 
 class WriteTimestampsOperator(bpy.types.Operator):
     bl_idname = "derammo.write_timestamps"
@@ -50,40 +21,41 @@ class WriteTimestampsOperator(bpy.types.Operator):
                 mf.write('{} {}\n'.format(frame_to_time(marker.frame, fps, fps_base), marker.name))
         return {'FINISHED'}
 
-class RenderAudioFilesOperator(bpy.types.Operator):
+class RenderAudioFilesOperator(ModalTimerOperator):
     bl_idname = "derammo.render_audio_files"
     bl_label = "Render Audio Files"
     bl_description = "Render audio files between timeline markers in the VSE"
-    
-    def execute(self, context):
+
+    track = 1
+    previous = None
+    markers = []    
+
+    def work(self, context):
+        if self.previous is None:
+            self.report({'ERROR'}, "Priming previous marker, that should have been set already.")
+            self.previous = self.markers.pop(0)
+            return
+            
+        next = self.markers.pop(0)
         output_dir = get_output_dir(self, context)
         scene = context.scene
-        markers = scene.timeline_markers
-        sorted_markers = sorted(markers, key=lambda marker: marker.frame)
 
         # save rendering settings
         o_frame_start = scene.frame_start
         o_frame_end = scene.frame_end
         o_codec = scene.render.ffmpeg.codec
         o_render_filepath = scene.render.filepath
-
-        # Configure render settings for audio only
-        scene.render.image_settings.file_format = 'FFMPEG'
-        scene.render.ffmpeg.format = 'MPEG4'  
-        scene.render.ffmpeg.audio_codec = 'AAC'
-        scene.render.ffmpeg.codec =  'NONE'
-
-        track = 1
-        previous = None
         
-        for marker in sorted_markers:
-            if previous is None:
-                previous = marker
-                continue
-            
-            output_filename = re.sub(r"[^a-zA-Z0-9]", "_", previous.name) + ".aac"
-            scene.frame_start = previous.frame
-            scene.frame_end = marker.frame
+        try:
+            # Configure render settings for audio only
+            scene.render.image_settings.file_format = 'FFMPEG'
+            scene.render.ffmpeg.format = 'MPEG4'  
+            scene.render.ffmpeg.audio_codec = 'AAC'
+            scene.render.ffmpeg.codec =  'NONE'
+
+            output_filename = re.sub(r"[^a-zA-Z0-9]", "_", self.previous.name) + ".aac"
+            scene.frame_start = self.previous.frame
+            scene.frame_end = next.frame
 
             # Set the output file path
             scene.render.filepath = output_dir + 'audio/' + output_filename
@@ -92,48 +64,58 @@ class RenderAudioFilesOperator(bpy.types.Operator):
             scene.sequence_editor_create() # Create a sequence editor if one doesn't exist
             scene.render.use_sequencer = True
 
-            # Perform the audio mixdown
+            # Perform the audio mixdown, blocking
             self.report({'INFO'}, "rendering " + scene.render.filepath)
             bpy.ops.sound.mixdown(filepath=scene.render.filepath, check_existing=True, container='AAC', codec='AAC')
-        
+            
             # encapsulate as M4A            
-            command = '/opt/homebrew/bin/ffmpeg -y -i ' + scene.render.filepath + ' '
+            encapsulate = '/opt/homebrew/bin/ffmpeg -y -i ' + scene.render.filepath + ' '
             
             # suppress non-error output that ends up in stderr
-            command += '-loglevel error -hide_banner -nostats '
+            encapsulate += '-loglevel error -hide_banner -nostats '
 
             # album art on all tracks
-            command += '-i ' + output_dir + 'album.png ' \
-                       + '-map 0:0 -map 1:0 '
+            encapsulate += '-i ' + output_dir + 'album.png ' \
+                        + '-map 0:0 -map 1:0 '
 
-            command += '-codec copy ' \
+            encapsulate += '-codec copy ' \
                 + '-id3v2_version 3 ' \
-                + '-metadata title="' + previous.name + '" ' \
+                + '-metadata title="' + self.previous.name + '" ' \
                 + '-metadata album="' + scene.name + '" ' \
-                + '-metadata track="' + str(track) + '" ' \
+                + '-metadata track="' + str(self.track) + '" ' \
                 + '-metadata artist="derammo" ' \
                 + '-metadata genre="Musicals" '
                 
             # album art on all tracks
-            command += '-disposition:v attached_pic -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" '
+            encapsulate += '-disposition:v attached_pic -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" '
             
-            command += re.sub(r".aac$", ".m4a", scene.render.filepath)
+            encapsulate += re.sub(r".aac$", ".m4a", scene.render.filepath)
 
-            execute_command(self, command)
-            track += 1
+            # render m4a
+            execute_command(self, encapsulate)
                 
             # remove AAC
             execute_command(self, '/usr/bin/trash ' + scene.render.filepath)
             
-            previous = marker    
-            
-        # restore render settings
-        scene.frame_start = o_frame_start
-        scene.frame_end = o_frame_end
-        scene.render.filepath = o_render_filepath
-        scene.render.ffmpeg.codec = o_codec
-        return {'FINISHED'}
+            self.previous = next    
+            self.track += 1
+        finally:    
+            # restore render settings
+            scene.frame_start = o_frame_start
+            scene.frame_end = o_frame_end
+            scene.render.filepath = o_render_filepath
+            scene.render.ffmpeg.codec = o_codec
 
+            self.flush_reports(context)
+
+    def execute(self, context):
+        self.track = 1
+        self.markers = sorted(context.scene.timeline_markers, key=lambda marker: marker.frame)
+        self.previous = self.markers.pop(0) if self.markers else None
+        self.schedule([self.work] * len(self.markers))
+
+        return super().execute(context)
+    
 class FillGapsOperator(bpy.types.Operator):
     bl_idname = "derammo.fill_gaps"
     bl_label = "Fill Channel Gaps"
@@ -200,22 +182,33 @@ class PrintStripsOperator(bpy.types.Operator):
 
 def strip_menu_extension(self, context):
     self.layout.separator()
-    self.layout.operator(PrintStripsOperator.bl_idname, text="Print Channel Strips")
-    self.layout.operator(FillGapsOperator.bl_idname, text="Fill Channel Gaps")
+    self.layout.operator(PrintStripsOperator.bl_idname, text=PrintStripsOperator.bl_label)
+    self.layout.operator(FillGapsOperator.bl_idname, text=FillGapsOperator.bl_label)
 
 def render_menu_extension(self, context):
     self.layout.separator()
-    self.layout.operator(WriteTimestampsOperator.bl_idname, text="Write Timestamps for Youtube")
-    self.layout.operator(RenderAudioFilesOperator.bl_idname, text="Render Audio Files")
+    self.layout.operator(WriteTimestampsOperator.bl_idname, text=WriteTimestampsOperator.bl_label)
+    self.layout.operator(RenderAudioFilesOperator.bl_idname, text=RenderAudioFilesOperator.bl_label)
+
+classes = [
+    PrintStripsOperator,
+    FillGapsOperator,
+    WriteTimestampsOperator,
+    RenderAudioFilesOperator,
+]
 
 def register():
-    bpy.utils.register_class(PrintStripsOperator)
-    bpy.utils.register_class(FillGapsOperator)
-    bpy.utils.register_class(WriteTimestampsOperator)
-    bpy.utils.register_class(RenderAudioFilesOperator)
+    for cls in classes:
+        bpy.utils.register_class(cls)
     bpy.types.SEQUENCER_MT_strip.append(strip_menu_extension)
     bpy.types.TOPBAR_MT_render.append(render_menu_extension)
     print("registered")
+
+def unregister():
+    bpy.types.TOPBAR_MT_render.remove(render_menu_extension)
+    bpy.types.SEQUENCER_MT_strip.remove(strip_menu_extension)
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
 
 def unregister():
     bpy.types.TOPBAR_MT_render.remove(render_menu_extension)
@@ -224,6 +217,3 @@ def unregister():
     bpy.utils.unregister_class(WriteTimestampsOperator)
     bpy.utils.unregister_class(FillGapsOperator)
     bpy.utils.unregister_class(PrintStripsOperator)
-
-
-
